@@ -2,10 +2,10 @@ import streamlit as st
 import pandas as pd
 import re
 from nba_api.live.nba.endpoints import scoreboard, boxscore, playbyplay
-from nba_api.stats.endpoints import playergamelog
+from nba_api.stats.endpoints import playergamelog, playbyplayv2
 from nba_api.stats.static import players
 
-# --- הגדרות עמוד ---
+# --- הגדרות עיצוב ---
 st.set_page_config(page_title="Deni Stats", page_icon="🏀")
 st.title("🏀 Deni Avdija Tracker")
 
@@ -16,24 +16,78 @@ def get_player_id():
     p = players.find_players_by_full_name("Deni Avdija")
     return p[0]['id'] if p else None
 
-# פונקציה שממירה זמן שעון (למשל PT10M30S) לדקה במשחק (0 עד 48)
-def parse_nba_clock(period, clock_str):
+def parse_time_string(time_str):
+    # המרת זמן כמו "10:30" או "PT10M30S" למספר דקות שעברו מתחילת הרבע
+    # חוזרים עם דקות שנותרו ברבע
     try:
-        # הפורמט מגיע כ- PT12M00.00S
-        match = re.search(r'PT(\d+)M(\d+)\.', clock_str)
-        if match:
-            minutes_left = int(match.group(1))
-            seconds_left = int(match.group(2))
-            
-            # חישוב כמה דקות עברו מתחילת המשחק
-            # כל רבע הוא 12 דקות
-            quarter_start_time = (period - 1) * 12
-            minutes_passed_in_quarter = 12 - (minutes_left + seconds_left/60)
-            
-            return quarter_start_time + minutes_passed_in_quarter
+        if "PT" in str(time_str): # פורמט לייב
+            match = re.search(r'PT(\d+)M(\d+)\.', str(time_str))
+            if match:
+                return 12 - (int(match.group(1)) + int(match.group(2))/60)
+        elif ":" in str(time_str): # פורמט היסטורי (10:45)
+            mins, secs = map(int, str(time_str).split(':'))
+            return 12 - (mins + secs/60)
     except:
-        return (period - 1) * 12
+        pass
     return 0
+
+def generate_chart_data(game_id, player_id, is_live=False):
+    # פונקציה חכמה שבונה גרף גם למשחק חי וגם להיסטורי
+    chart_data = [{"Minute": 0, "Points": 0}]
+    running_score = 0
+    
+    try:
+        if is_live:
+            # שימוש ב-API של לייב
+            pbp = playbyplay.PlayByPlay(game_id).get_dict()
+            actions = pbp['game']['actions']
+            for action in actions:
+                if action['personId'] == player_id and action['isScore'] == 1:
+                    # חישוב זמן
+                    period = action['period']
+                    minutes_passed = ((period - 1) * 12) + parse_time_string(action['clock'])
+                    
+                    # חישוב נקודות
+                    points = 2
+                    desc = action['description']
+                    if "Free Throw" in desc: points = 1
+                    elif "3pt Shot" in desc: points = 3
+                    
+                    running_score += points
+                    chart_data.append({"Minute": minutes_passed, "Points": running_score})
+        else:
+            # שימוש ב-API היסטורי (PlayByPlayV2) - עובד למשחקים שנגמרו
+            pbp = playbyplayv2.PlayByPlayV2(game_id).get_data_frames()[0]
+            # סינון המהלכים של דני שהם סלים
+            # EVENTMSGTYPE: 1 = סל שדה, 3 = עונשין
+            deni_actions = pbp[((pbp['PLAYER1_ID'] == player_id) & (pbp['EVENTMSGTYPE'].isin([1, 3])))]
+            
+            for index, row in deni_actions.iterrows():
+                # בדיקה אם זו החטאה (ב-V2 לפעמים עונשין מופיע גם כהחטאה תחת סוג 3, אז נבדוק ניקוד)
+                # דרך פשוטה יותר: זיהוי לפי תיאור או Score margin אם קיים, אבל נלך על זיהוי סוג זריקה
+                
+                points = 0
+                desc = str(row['HOMEDESCRIPTION']) + str(row['VISITORDESCRIPTION'])
+                
+                if row['EVENTMSGTYPE'] == 3: # עונשין
+                    if "MISS" not in desc: # רק אם לא החטיא
+                        points = 1
+                elif row['EVENTMSGTYPE'] == 1: # סל שדה
+                    points = 3 if "3PT" in desc else 2
+                
+                if points > 0:
+                    period = row['PERIOD']
+                    time_str = row['PCTIMESTRING'] # פורמט 10:45
+                    minutes_passed = ((period - 1) * 12) + parse_time_string(time_str)
+                    
+                    running_score += points
+                    chart_data.append({"Minute": minutes_passed, "Points": running_score})
+                    
+        return pd.DataFrame(chart_data)
+
+    except Exception as e:
+        print(f"Error generating chart: {e}")
+        return pd.DataFrame()
 
 # --- לוגיקה ראשית ---
 
@@ -46,123 +100,78 @@ if not deni_id:
 board = scoreboard.ScoreBoard()
 games = board.games.get_dict()
 live_game_found = False
-game_id_found = None
 
-st.write("Checking for live games...")
+st.write("Checking status...")
 
+# 1. ניסיון למצוא משחק חי
 for game in games:
     if game['gameStatus'] == 2: # משחק פעיל
         try:
-            # בדיקה אם דני משחק במשחק הזה
             box = boxscore.BoxScore(game_id=game['gameId']).game.get_dict()
             all_players = box['homeTeam']['players'] + box['awayTeam']['players']
             
-            player_stats = None
             for p in all_players:
                 if p['personId'] == deni_id:
-                    player_stats = p
-                    break
-            
-            if player_stats:
-                live_game_found = True
-                game_id_found = game['gameId']
-                
-                # --- תצוגת נתונים ראשית ---
-                st.success(f"🔴 LIVE: {box['awayTeam']['teamName']} vs {box['homeTeam']['teamName']}")
-                
-                col1, col2, col3 = st.columns(3)
-                col1.metric("Points", player_stats['statistics']['points'])
-                col2.metric("Rebounds", player_stats['statistics']['reboundsTotal'])
-                col3.metric("Assists", player_stats['statistics']['assists'])
-                
-                st.caption(f"Minutes: {player_stats['statistics']['minutes']} | FG: {player_stats['statistics']['fieldGoalsMade']}/{player_stats['statistics']['fieldGoalsAttempted']}")
-
-                # --- יצירת הגרף (Play by Play) ---
-                st.subheader("📈 Points Progression")
-                try:
-                    pbp = playbyplay.PlayByPlay(game_id_found).get_dict()
-                    actions = pbp['game']['actions']
+                    live_game_found = True
+                    st.success(f"🔴 LIVE: {box['awayTeam']['teamName']} vs {box['homeTeam']['teamName']}")
                     
-                    chart_data = []
-                    running_score = 0
-                    
-                    # נקודת התחלה (0,0)
-                    chart_data.append({"Minute": 0, "Points": 0})
+                    # נתונים
+                    c1, c2, c3 = st.columns(3)
+                    c1.metric("Points", p['statistics']['points'])
+                    c2.metric("Rebounds", p['statistics']['reboundsTotal'])
+                    c3.metric("Assists", p['statistics']['assists'])
+                    st.caption(f"Min: {p['statistics']['minutes']}")
 
-                    for action in actions:
-                        # בדיקה אם הפעולה קשורה לדני והיא קליעה (סל או עונשין)
-                        if action['personId'] == deni_id and action['isScore'] == 1:
-                            # חישוב הזמן
-                            game_minute = parse_nba_clock(action['period'], action['clock'])
-                            
-                            # עדכון הניקוד המצטבר (אנחנו סומכים שהסדר כרונולוגי)
-                            # אבל ה-API לפעמים נותן רק את סוג הזריקה, אז נחלץ מהתיאור או נספור לבד
-                            # גישה פשוטה: נחפש כמה נקודות זה שווה
-                            points_added = 0
-                            desc = action['description']
-                            if "Free Throw" in desc: points_added = 1
-                            elif "3pt Shot" in desc: points_added = 3
-                            else: points_added = 2
-                            
-                            running_score += points_added
-                            chart_data.append({"Minute": game_minute, "Points": running_score})
-                    
-                    # הוספת הנקודה העכשווית (סוף הגרף)
-                    current_min_str = player_stats['statistics']['minutes']
-                    # המרת דקות מחרוזת למספר (בערך)
-                    try:
-                        curr_min_val = float(current_min_str.replace("PT","").replace("M",""))
-                    except:
-                        curr_min_val = chart_data[-1]["Minute"] if chart_data else 0
-
-                    if running_score > 0:
-                        chart_data.append({"Minute": curr_min_val, "Points": running_score})
-                        
-                        df_chart = pd.DataFrame(chart_data)
+                    # גרף
+                    st.subheader("📈 Scoring Timeline")
+                    df_chart = generate_chart_data(game['gameId'], deni_id, is_live=True)
+                    if not df_chart.empty:
                         st.line_chart(df_chart, x="Minute", y="Points")
-                    else:
-                        st.info("No points scored yet to show on graph.")
-
-                except Exception as e:
-                    st.write("Graph data not available yet.")
-                    print(e)
-
-                break # יציאה מהלולאה כי מצאנו משחק
+                    
+                    break
         except:
             continue
 
-# --- אם אין משחק חי: הצגת משחק אחרון ---
+# 2. אם אין משחק חי - היסטוריה + גרף
 if not live_game_found:
-    st.info("⚪ No live game right now. Showing last game stats:")
-    
     try:
         gamelog = playergamelog.PlayerGameLog(player_id=deni_id)
         df = gamelog.get_data_frames()[0]
         
         if not df.empty:
             last_game = df.iloc[0]
+            game_id = last_game['Game_ID']
             
-            st.subheader(f"📅 {last_game['GAME_DATE']}")
-            st.caption(f"Matchup: {last_game['MATCHUP']} | Result: {last_game['WL']}")
+            st.info(f"⚪ Last Game: {last_game['GAME_DATE']}")
+            st.caption(f"{last_game['MATCHUP']} | {last_game['WL']}")
             
-            col1, col2, col3 = st.columns(3)
-            col1.metric("Points", last_game['PTS'])
-            col2.metric("Rebounds", last_game['REB'])
-            col3.metric("Assists", last_game['AST'])
+            # כרטיסי מידע
+            c1, c2, c3 = st.columns(3)
+            c1.metric("Points", last_game['PTS'])
+            c2.metric("Rebounds", last_game['REB'])
+            c3.metric("Assists", last_game['AST'])
             
-            # טבלה נקייה (בלי האינדקס 0)
+            # טבלה
             st.dataframe(pd.DataFrame({
                 'Steals': [last_game['STL']],
                 'Blocks': [last_game['BLK']],
                 'Minutes': [last_game['MIN']]
             }), hide_index=True)
             
+            # --- כאן הקסם: גרף גם למשחק עבר ---
+            st.subheader("📈 Scoring Timeline (Last Game)")
+            with st.spinner('Loading play-by-play data...'):
+                df_chart = generate_chart_data(game_id, deni_id, is_live=False)
+                if not df_chart.empty:
+                    st.line_chart(df_chart, x="Minute", y="Points")
+                else:
+                    st.write("Not enough data for graph.")
+            
         else:
             st.write("No games found for this season yet.")
             
     except Exception as e:
-        st.error(f"Error fetching history: {e}")
+        st.error(f"Could not load history: {e}")
 
-# כפתור רענון
-if st.button('Refresh Data'):
+if st.button('Refresh'):
     st.rerun()
