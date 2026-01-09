@@ -73,11 +73,11 @@ if not live_game_found:
             col3.metric("Assists", last_game['AST'])
             
             # טבלה קטנה לנתונים נוספים
-            st.table(pd.DataFrame({
+            st.dataframe(pd.DataFrame({
                 'Steals': [last_game['STL']],
                 'Blocks': [last_game['BLK']],
                 'Minutes': [last_game['MIN']]
-            }))
+            }), hide_index=True)
             
         else:
             st.write("No games found for this season yet.")
@@ -87,4 +87,5 @@ if not live_game_found:
 
 # כפתור רענון
 if st.button('Refresh Data'):
+
     st.rerun()
