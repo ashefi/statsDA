@@ -175,3 +175,4 @@ if not live_game_found:
 
 if st.button('Refresh'):
     st.rerun()
+
