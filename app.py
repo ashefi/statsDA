@@ -2,6 +2,7 @@ import streamlit as st
 import pandas as pd
 import requests
 import re
+import plotly.express as px  # ספרייה לגרפים יפים יותר
 from nba_api.stats.endpoints import playergamelog
 from nba_api.stats.static import players
 from nba_api.live.nba.endpoints import scoreboard, boxscore
@@ -21,7 +22,7 @@ def get_json_with_headers(url):
         "Connection": "keep-alive"
     }
     try:
-        response = requests.get(url, headers=headers, timeout=10)
+        response = requests.get(url, headers=headers, timeout=5)
         if response.status_code == 200:
             return response.json()
     except:
@@ -51,18 +52,17 @@ def parse_time(time_str):
     return 12.0
 
 def get_chart_data(game_id, player_id):
+    # מנסה להשיג נתונים לגרף מומנטום
     chart_data = [{"Minute": 0, "Points": 0}]
     running_score = 0
     found = False
 
-    # שיטה 1: Live API (השיטה המועדפת)
     url_live = f"https://cdn.nba.com/static/json/liveData/playbyplay/playbyplay_{game_id}.json"
     data = get_json_with_headers(url_live)
     
     if data and 'game' in data and 'actions' in data['game']:
         actions = data['game']['actions']
         for action in actions:
-            # --- התיקון הגדול כאן: שימוש ב-get כדי למנוע קריסה ---
             is_score = action.get('isScore', 0)
             person_id = action.get('personId', 0)
             
@@ -81,45 +81,9 @@ def get_chart_data(game_id, player_id):
                 chart_data.append({"Minute": minute_in_game, "Points": running_score})
         found = True
 
-    # שיטה 2: גיבוי (PlayByPlayV2) למקרה ששיטה 1 נכשלה
-    if not found:
-        url_v2 = f"https://stats.nba.com/stats/playbyplayv2?GameID={game_id}&StartPeriod=0&EndPeriod=14"
-        data_v2 = get_json_with_headers(url_v2)
-        
-        if data_v2 and 'resultSets' in data_v2:
-            headers = data_v2['resultSets'][0]['headers']
-            rows = data_v2['resultSets'][0]['rowSet']
-            try:
-                i_pid = headers.index("PLAYER1_ID")
-                i_desc = headers.index("HOMEDESCRIPTION")
-                i_visit_desc = headers.index("VISITORDESCRIPTION")
-                i_period = headers.index("PERIOD")
-                i_clock = headers.index("PCTIMESTRING")
-                i_event = headers.index("EVENTMSGTYPE")
-
-                for row in rows:
-                    if row[i_pid] == player_id:
-                        event_type = row[i_event]
-                        desc = str(row[i_desc]) + str(row[i_visit_desc])
-                        
-                        is_basket = (event_type == 1)
-                        is_ft = (event_type == 3 and "MISS" not in desc)
-                        
-                        if is_basket or is_ft:
-                            points_added = 2
-                            if "3PT" in desc: points_added = 3
-                            elif is_ft: points_added = 1
-                            
-                            period = row[i_period]
-                            time_left = parse_time(row[i_clock])
-                            minute_in_game = (period - 1) * 12 + (12 - time_left)
-                            
-                            running_score += points_added
-                            chart_data.append({"Minute": minute_in_game, "Points": running_score})
-            except:
-                pass
-
-    return pd.DataFrame(chart_data)
+    if found and len(chart_data) > 1:
+        return pd.DataFrame(chart_data)
+    return pd.DataFrame()
 
 # --- לוגיקה ראשית ---
 
@@ -147,14 +111,19 @@ for game in games_dict:
                     live_found = True
                     st.success(f"🔴 LIVE: {bx['awayTeam']['teamName']} vs {bx['homeTeam']['teamName']}")
                     
+                    # נתונים
+                    stats = p['statistics']
                     c1, c2, c3 = st.columns(3)
-                    c1.metric("Points", p['statistics']['points'])
-                    c2.metric("Rebounds", p['statistics']['reboundsTotal'])
-                    c3.metric("Assists", p['statistics']['assists'])
+                    c1.metric("Points", stats['points'])
+                    c2.metric("Rebounds", stats['reboundsTotal'])
+                    c3.metric("Assists", stats['assists'])
                     
-                    st.subheader("📈 Game Flow")
+                    # גרף מומנטום (בלייב זה תמיד עובד)
+                    st.subheader("📈 Scoring Momentum")
                     df = get_chart_data(game['gameId'], deni_id)
-                    st.line_chart(df, x="Minute", y="Points")
+                    if not df.empty:
+                        st.line_chart(df, x="Minute", y="Points")
+                    
                     break
         except: pass
 
@@ -171,22 +140,45 @@ if not live_found:
             st.info(f"Last Game: {last['GAME_DATE']}")
             st.caption(f"{last['MATCHUP']} | {last['WL']}")
             
+            # כרטיסי מידע
             c1, c2, c3 = st.columns(3)
             c1.metric("Points", last['PTS'])
             c2.metric("Rebounds", last['REB'])
             c3.metric("Assists", last['AST'])
-            
-            st.subheader("📈 Game Flow")
-            df_chart = get_chart_data(gid, deni_id)
-            if len(df_chart) > 1:
-                st.line_chart(df_chart, x="Minute", y="Points")
-            else:
-                st.warning("Could not generate chart.")
 
+            st.divider()
+
+            # --- ניסיון לגרף מומנטום (רק אם מצליח) ---
+            df_chart = get_chart_data(gid, deni_id)
+            if not df_chart.empty:
+                st.subheader("📈 Game Flow")
+                st.line_chart(df_chart, x="Minute", y="Points")
+            
+            # --- גרף התפלגות קליעות (עובד תמיד!) ---
+            # חישוב הנקודות
+            pts = last['PTS']
+            pts_3 = last['FG3M'] * 3
+            pts_ft = last['FTM']
+            pts_2 = pts - pts_3 - pts_ft
+            
+            # אם קלע נקודות, נציג גרף עוגה
+            if pts > 0:
+                st.subheader("🎯 Scoring Breakdown")
+                chart_data = pd.DataFrame({
+                    'Type': ['2 Pointers', '3 Pointers', 'Free Throws'],
+                    'Points': [pts_2, pts_3, pts_ft]
+                })
+                fig = px.pie(chart_data, values='Points', names='Type', hole=0.4)
+                fig.update_layout(height=300, margin=dict(t=0, b=0, l=0, r=0))
+                st.plotly_chart(fig, use_container_width=True)
+
+            # טבלה תחתונה
             st.dataframe(pd.DataFrame({
                 'Min': [last['MIN']],
                 'FG': [f"{last['FGM']}/{last['FGA']}"],
-                '3PT': [f"{last['FG3M']}/{last['FG3A']}"]
+                '3PT': [f"{last['FG3M']}/{last['FG3A']}"],
+                'STL': [last['STL']],
+                'BLK': [last['BLK']]
             }), hide_index=True)
             
         else:
